@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>订阅分享 — 上传到 Worker</title>
+
+  <!-- Tailwind CDN（无构建） -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <style>
+    /* 轻微自定义 */
+    body { background: linear-gradient(180deg,#f7fbff 0%, #f3f7fb 100%); }
+    .glass { background: rgba(255,255,255,0.85); backdrop-filter: blur(6px); }
+  </style>
+</head>
+<body class="min-h-screen flex items-center justify-center p-6">
+
+  <div class="w-full max-w-3xl glass rounded-2xl shadow-lg p-6">
+    <div class="flex items-center justify-between mb-4">
+      <h1 class="text-2xl font-semibold">订阅短链分享</h1>
+      <div class="text-sm text-gray-600">上传到 Worker，并显示 KV 使用量</div>
+    </div>
+
+    <!-- Worker 选择 -->
+    <div class="mb-4 grid grid-cols-1 md:grid-cols-3 gap-3">
+      <div>
+        <label class="block text-sm text-gray-700 mb-1">选择后端 Worker</label>
+        <select id="workerSelect" class="w-full p-2 border rounded-md">
+          <!-- JS 会填充 -->
+        </select>
+      </div>
+
+      <div>
+        <label class="block text-sm text-gray-700 mb-1">上传内容大小（实时）</label>
+        <div id="sizeHint" class="p-2 border rounded-md text-sm text-gray-600">0 B</div>
+      </div>
+
+      <div class="flex items-end">
+        <button id="btnStats" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white p-2 rounded-md">查看 KV 使用</button>
+      </div>
+    </div>
+
+    <!-- 内容输入 -->
+    <textarea id="content"
+      class="w-full h-48 p-3 border rounded-md resize-y focus:ring-2 focus:ring-indigo-200"
+      placeholder="把要分享的订阅或配置粘贴到这里（支持长文本）"></textarea>
+
+    <!-- 行为按钮 -->
+    <div class="mt-4 flex gap-3">
+      <button id="btnUpload" class="flex-1 bg-blue-600 hover:bg-blue-700 text-white p-3 rounded-md">上传并生成短链</button>
+      <button id="btnClear" class="bg-gray-100 hover:bg-gray-200 p-3 rounded-md">清空</button>
+    </div>
+
+    <!-- 结果 / 提示 -->
+    <div id="result" class="mt-5"></div>
+
+    <!-- Stats 显示 -->
+    <div id="statsBox" class="mt-5 p-4 bg-gray-50 border rounded-md hidden">
+      <div class="text-sm text-gray-700 mb-2">KV 使用统计（估算）</div>
+      <div id="statsContent" class="text-sm text-gray-800"></div>
+    </div>
+
+    <div class="mt-6 text-xs text-gray-500">
+      说明：上传后会在选定 Worker 的 KV 中保存内容。外部 base64 转换由第三方服务处理（仅拼接链接）。KV 上限按 Cloudflare 1 GB 计算并显示百分比（估算）。
+    </div>
+  </div>
+
+<script>
+/* ===================== 配置区域 ===================== */
+/* 在这里填入你的 Worker 域名列表（由你提供） */
+const WORKERS = [
+  "https://aaa.workers.dev",
+  "https://bbb.workers.dev"
+];
+
+/* 外部 base64 服务（你给的例子） */
+const BASE64_SERVICE = "https://bast64.niudog.de5.net/?url=";
+
+/* 1GB 常数 */
+const ONE_GB = 1024 * 1024 * 1024;
+
+/* ===================== 工具函数 ===================== */
+function humanSize(bytes) {
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1024*1024) return (bytes/1024).toFixed(2) + " KB";
+  if (bytes < 1024*1024*1024) return (bytes/1024/1024).toFixed(2) + " MB";
+  return (bytes/1024/1024/1024).toFixed(2) + " GB";
+}
+function escapeHtml(s){ return s.replace(/[&<>"]/g, c=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;' }[c])); }
+
+/* ===================== 页面逻辑 ===================== */
+const select = document.getElementById("workerSelect");
+const contentEl = document.getElementById("content");
+const sizeHint = document.getElementById("sizeHint");
+const btnUpload = document.getElementById("btnUpload");
+const btnClear = document.getElementById("btnClear");
+const result = document.getElementById("result");
+const btnStats = document.getElementById("btnStats");
+const statsBox = document.getElementById("statsBox");
+const statsContent = document.getElementById("statsContent");
+
+// 填充下拉
+WORKERS.forEach(w => {
+  const opt = document.createElement("option");
+  opt.value = w;
+  opt.textContent = w.replace(/^https?:\/\//, "");
+  select.appendChild(opt);
+});
+
+// 更新 size 显示
+contentEl.addEventListener("input", () => {
+  const text = contentEl.value || "";
+  const encoder = new TextEncoder();
+  const bytes = encoder.encode(text).length;
+  sizeHint.textContent = humanSize(bytes);
+});
+
+// 清空
+btnClear.addEventListener("click", () => {
+  contentEl.value = "";
+  sizeHint.textContent = "0 B";
+  result.innerHTML = "";
+  statsBox.classList.add("hidden");
+});
+
+// 上传
+btnUpload.addEventListener("click", async () => {
+  const workerUrl = select.value;
+  const text = contentEl.value.trim();
+  if (!text) return alert("内容不能为空");
+
+  btnUpload.disabled = true;
+  btnUpload.textContent = "上传中...";
+
+  try {
+    const resp = await fetch(workerUrl + "/upload", {
+      method: "POST",
+      headers: { "Content-Type": "text/plain" },
+      body: text
+    });
+
+    if (!resp.ok) {
+      const txt = await resp.text();
+      throw new Error(txt || resp.status + " " + resp.statusText);
+    }
+
+    const data = await resp.json();
+    // data: { key, url }
+    const key = data.key;
+    const rawShare = workerUrl + "/?key=" + encodeURIComponent(key);
+    const base64Share = BASE64_SERVICE + encodeURIComponent(rawShare);
+
+    // 本地文件大小
+    const encoder = new TextEncoder();
+    const sizeBytes = encoder.encode(text).length;
+
+    result.innerHTML = `
+      <div class="p-4 bg-white border rounded-md">
+        <div class="mb-2"><strong>分享链接</strong></div>
+        <div class="flex items-center gap-2">
+          <input readonly class="flex-1 p-2 border rounded-md bg-gray-50 text-sm" value="${escapeHtml(rawShare)}" />
+          <button id="copyRaw" class="px-3 py-2 bg-indigo-600 text-white rounded-md">复制</button>
+        </div>
+
+        <div class="mt-3 mb-2"><strong>Base64 外链（第三方）</strong></div>
+        <div class="flex items-center gap-2">
+          <input readonly class="flex-1 p-2 border rounded-md bg-gray-50 text-sm" value="${escapeHtml(base64Share)}" />
+          <button id="copyBase64" class="px-3 py-2 bg-indigo-600 text-white rounded-md">复制</button>
+        </div>
+
+        <div class="mt-3 text-sm text-gray-600">
+          本地大小： ${humanSize(sizeBytes)}
+        </div>
+      </div>
+    `;
+
+    // 绑定复制事件
+    document.getElementById("copyRaw").addEventListener("click", () => {
+      navigator.clipboard.writeText(rawShare).then(()=> alert("已复制 原始链接"));
+    });
+    document.getElementById("copyBase64").addEventListener("click", () => {
+      navigator.clipboard.writeText(base64Share).then(()=> alert("已复制 Base64 链接"));
+    });
+
+  } catch (err) {
+    alert("上传失败： " + err.message);
+    console.error(err);
+  } finally {
+    btnUpload.disabled = false;
+    btnUpload.textContent = "上传并生成短链";
+  }
+});
+
+// 查看 KV 使用
+btnStats.addEventListener("click", async () => {
+  const workerUrl = select.value;
+  statsBox.classList.add("hidden");
+  statsContent.innerHTML = "查询中... 这一步可能会较慢（KV 列表遍历）";
+
+  try {
+    const resp = await fetch(workerUrl + "/stats");
+    if (!resp.ok) throw new Error("请求失败 " + resp.status);
+    const json = await resp.json();
+    const totalBytes = json.totalBytes || 0;
+    const count = json.count || 0;
+    const percent = ((totalBytes / ONE_GB) * 100).toFixed(3);
+    const human = humanSize(totalBytes);
+
+    statsContent.innerHTML = `
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-2">
+        <div><strong>对象数</strong><div class="text-sm text-gray-700">${count}</div></div>
+        <div><strong>总占用</strong><div class="text-sm text-gray-700">${human}</div></div>
+        <div><strong>占 1GB</strong><div class="text-sm text-gray-700">${percent}%</div></div>
+      </div>
+      <div class="mt-3 text-xs text-gray-500">提示：KV 统计通过遍历计算，若条目极多可能较慢。</div>
+    `;
+    statsBox.classList.remove("hidden");
+  } catch (err) {
+    statsContent.innerHTML = "查询失败： " + err.message;
+    statsBox.classList.remove("hidden");
+  }
+});
+</script>
+</body>
+</html>
